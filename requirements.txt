@@ -1,2 +1,1 @@
-aiogram>=3.7,<4.0
-aiosqlite>=0.19
+pyTelegramBotAPI>=4.14.0
