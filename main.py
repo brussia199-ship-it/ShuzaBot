@@ -1,789 +1,467 @@
-# ═══════════════════════════════════════════════════════════
-#  RubUP — Casino Bot for ShuzaGram (All-in-One)
-#  Запуск: python main.py
-# ═══════════════════════════════════════════════════════════
-
-import asyncio
-import logging
-import os
+import telebot
+from telebot import types, apihelper
+import sqlite3
 import random
 import string
-from datetime import datetime, timedelta
+import time
 
-import aiosqlite
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.client.telegram import TelegramAPIServer
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, BotCommand
-)
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+# --- SHUZAGRAM ---
+apihelper.API_URL = "https://api.shuzagram.com/bot{0}/{1}"
+TOKEN = "1780243441:qnHVWd0YLEYxOn20Av9O-QnlSdkTmRq9z33"
+ADMIN_ID = 17802434833
+SUPPORT = "@MusorchikSupport"
+ADMIN_U = "@Musorchik"
+BOT_U = "@MusorchikBot"
+DB = "casino.db"
 
-# ─── КОНФИГ ────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "1780243489:onREfB__lmAU_28s4FXe4hSwEh_bORaCzSJ")
-API_BASE = "https://api.shuzagram.com"
+bot = telebot.TeleBot(TOKEN)
 
-ADMIN_ID = 1780243488
-ADMIN_USERNAME = "RubUPer"
-ADMIN_LINK = "http://sgq.me/RubUPer"
+# --- БД ---
+def db_init():
+    with sqlite3.connect(DB) as c:
+        cur = c.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, username TEXT, balance INTEGER DEFAULT 0,
+            total_bet INTEGER DEFAULT 0, total_won INTEGER DEFAULT 0)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+            charge_id TEXT UNIQUE, amount INTEGER, is_withdrawn INTEGER DEFAULT 0)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER,
+            status TEXT DEFAULT 'pending')""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, game TEXT,
+            bet INTEGER, win INTEGER, ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        cur.execute("INSERT OR IGNORE INTO settings VALUES ('win_rate', '45')")
+        cur.execute("INSERT OR IGNORE INTO settings VALUES ('min_bet', '10')")
+        cur.execute("INSERT OR IGNORE INTO settings VALUES ('min_wd', '100')")
+        c.commit()
 
-DB_PATH = "rubup.db"
-MIN_BET = 1
-MIN_WITHDRAW = 50
+def get_set(key, default="0"):
+    with sqlite3.connect(DB) as c:
+        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return r[0] if r else default
 
-DICE_FACE = {1: "⚀", 2: "⚁", 3: "⚂", 4: "⚃", 5: "⚄", 6: "⚅"}
-PRESET_BETS = [10, 50, 100, 500]
-PRESET_TOPUP = [50, 100, 250, 500, 1000]
+def set_set(key, val):
+    with sqlite3.connect(DB) as c:
+        c.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (key, str(val)))
+        c.commit()
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("RubUP")
+def get_user(uid):
+    with sqlite3.connect(DB) as c:
+        return c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
 
-# ─── БАЗА ДАННЫХ ───────────────────────────────────────────
-async def db_init():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                balance INTEGER DEFAULT 0,
-                total_wagered INTEGER DEFAULT 0,
-                reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )""")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS withdrawals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                amount INTEGER,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS topups (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                amount INTEGER,
-                code TEXT UNIQUE,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS checks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                creator_id INTEGER,
-                amount INTEGER,
-                code TEXT UNIQUE,
-                is_activated INTEGER DEFAULT 0,
-                activated_by INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('win_rate', '45')")
-        await db.commit()
+def ensure_user(uid, un):
+    with sqlite3.connect(DB) as c:
+        c.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (uid, un or "None"))
+        c.execute("UPDATE users SET username=? WHERE user_id=?", (un or "None", uid))
+        c.commit()
 
-async def get_setting(key: str, default: str = "0") -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT value FROM settings WHERE key=?", (key,)) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else default
+def get_bal(uid):
+    with sqlite3.connect(DB) as c:
+        r = c.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()
+        return r[0] if r else 0
 
-async def set_setting(key: str, value: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-        await db.commit()
+def add_bal(uid, amt):
+    with sqlite3.connect(DB) as c:
+        c.execute("INSERT INTO users (user_id, balance) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET balance=balance+excluded.balance", (uid, amt))
+        c.commit()
+        r = c.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()
+        return r[0] if r else 0
 
-async def ensure_user(uid: int, username: str | None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO users (user_id, username) VALUES (?, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username",
-            (uid, username or "None"),
+def add_stat(uid, bet, win):
+    with sqlite3.connect(DB) as c:
+        c.execute("UPDATE users SET total_bet=total_bet+?, total_won=total_won+? WHERE user_id=?", (bet, win, uid))
+        c.commit()
+
+def log_game(uid, game, bet, win):
+    with sqlite3.connect(DB) as c:
+        c.execute("INSERT INTO history (user_id, game, bet, win) VALUES (?, ?, ?, ?)", (uid, game, bet, win))
+        c.commit()
+
+# --- КЛАВИАТУРЫ ---
+def main_kb():
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.add(
+        types.KeyboardButton("🎮 Играть"), types.KeyboardButton("💳 Пополнить"),
+        types.KeyboardButton("💸 Вывести"), types.KeyboardButton("👤 Профиль"),
+        types.KeyboardButton("📜 История"), types.KeyboardButton("ℹ️ Помощь")
+    )
+    return m
+
+def games_kb():
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(
+        types.InlineKeyboardButton("🎲 Кубик", callback_data="g_dice"),
+        types.InlineKeyboardButton("🪙 Монетка", callback_data="g_coin"),
+        types.InlineKeyboardButton("💣 Мины", callback_data="g_mines"),
+        types.InlineKeyboardButton("🎰 Слоты", callback_data="g_slots"),
+        types.InlineKeyboardButton("🎯 Рулетка", callback_data="g_roul")
+    )
+    return m
+
+def admin_kb():
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(
+        types.InlineKeyboardButton("📊 Статистика", callback_data="a_stats"),
+        types.InlineKeyboardButton("🎲 Шанс выигрыша", callback_data="a_rate"),
+        types.InlineKeyboardButton("📥 Заявки на вывод", callback_data="a_wds")
+    )
+    return m
+
+# --- СТАРТ ---
+@bot.message_handler(commands=["start"])
+def start(m):
+    ensure_user(m.from_user.id, m.from_user.username)
+    bot.send_message(m.chat.id, f"👋 <b>Казино</b>\nБаланс: <b>{get_bal(m.from_user.id)} ⭐</b>\n\nПоддержка: {SUPPORT}\nАдмин: {ADMIN_U}", reply_markup=main_kb(), parse_mode="HTML")
+
+# --- ПРОФИЛЬ ---
+@bot.message_handler(func=lambda m: m.text == "👤 Профиль")
+def profile(m):
+    u = get_user(m.from_user.id)
+    if not u: return
+    bot.send_message(m.chat.id, f"👤 <b>Профиль</b>\n\nID: <code>{u[0]}</code>\nБаланс: <b>{u[2]} ⭐</b>\nВсего ставок: {u[3]}\nВсего выиграно: {u[4]}", reply_markup=main_kb(), parse_mode="HTML")
+
+# --- ПОПОЛНЕНИЕ (sendInvoice) ---
+@bot.message_handler(func=lambda m: m.text == "💳 Пополнить")
+def topup_menu(m):
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    for amt in [50, 100, 250, 500, 1000]:
+        mk.add(types.InlineKeyboardButton(f"{amt} ⭐", callback_data=f"top_{amt}"))
+    bot.send_message(m.chat.id, "Выберите сумму:", reply_markup=mk)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("top_"))
+def topup_invoice(c):
+    amount = int(c.data.split("_")[1])
+    payload = f"topup|{c.from_user.id}|{amount}"
+    try:
+        bot.send_invoice(
+            chat_id=c.message.chat.id,
+            title="Пополнение",
+            description=f"Пополнение на {amount} ⭐",
+            invoice_payload=payload,
+            provider_token="",
+            currency="XTR",
+            prices=[types.LabeledPrice(label="Пополнение", amount=amount)],
+            start_parameter="topup"
         )
-        await db.commit()
+    except Exception as e:
+        bot.answer_callback_query(c.id, f"Ошибка: {e}", show_alert=True)
+    bot.answer_callback_query(c.id)
 
-async def get_balance(uid: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT balance FROM users WHERE user_id=?", (uid,)) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else 0
+@bot.pre_checkout_query_handler(func=lambda q: True)
+def pre_checkout(q):
+    bot.answer_pre_checkout_query(q.id, ok=True)
 
-async def add_balance(uid: int, amount: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO users (user_id, balance) VALUES (?, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET balance = balance + excluded.balance",
-            (uid, amount),
-        )
-        await db.commit()
-        async with db.execute("SELECT balance FROM users WHERE user_id=?", (uid,)) as cur:
-            return (await cur.fetchone())[0]
+@bot.message_handler(content_types=['successful_payment'])
+def on_paid(m):
+    payload = m.successful_payment.invoice_payload
+    parts = payload.split("|")
+    if parts[0] == "topup":
+        uid, amount = int(parts[1]), int(parts[2])
+        add_bal(uid, amount)
+        bot.send_message(m.chat.id, f"✅ Пополнено на {amount} ⭐")
 
-async def add_wagered(uid: int, amount: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET total_wagered = total_wagered + ? WHERE user_id=?", (amount, uid))
-        await db.commit()
+# --- ВЫВОД ЧЕРЕЗ NFT-ПОДАРКИ (sendGift) ---
+@bot.message_handler(func=lambda m: m.text == "💸 Вывести")
+def withdraw_start(m):
+    bal = get_bal(m.from_user.id)
+    min_wd = int(get_set("min_wd"))
+    if bal < min_wd:
+        return bot.send_message(m.chat.id, f"❌ Минимум для вывода: {min_wd} ⭐", reply_markup=main_kb())
+    msg = bot.send_message(m.chat.id, f"Введите сумму для вывода (доступно {bal} ⭐):", reply_markup=types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(msg, withdraw_amount)
 
-# ─── КЛАВИАТУРЫ ────────────────────────────────────────────
-def kb(*buttons, adjust=None) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for text, data in buttons:
-        b.button(text=text, callback_data=data)
-    if adjust:
-        b.adjust(*adjust)
-    return b.as_markup()
-
-def main_menu_kb():
-    return kb(
-        ("🎮 Играть", "games"),
-        ("💳 Пополнить", "topup"),
-        ("💸 Вывести", "withdraw"),
-        ("🎁 Чеки", "checks_menu"),
-        ("👤 Профиль", "profile"),
-        adjust=(2, 2, 1),
-    )
-
-def admin_menu_kb():
-    return kb(
-        ("📊 Статистика", "adm_stats"),
-        ("🎲 Шанс выигрыша", "adm_chance"),
-        ("📣 Рассылка", "adm_broadcast"),
-        ("📥 Пополнения", "adm_topups"),
-        ("📤 Выводы", "adm_withdrawals"),
-        ("⬅️ В меню", "menu"),
-        adjust=(2, 2, 2),
-    )
-
-# ─── СОСТОЯНИЯ ─────────────────────────────────────────────
-class AdminStates(StatesGroup):
-    broadcast_msg = State()
-    set_chance = State()
-
-class UserStates(StatesGroup):
-    activate_check = State()
-
-# ─── РОУТЕР ────────────────────────────────────────────────
-router = Router()
-
-@router.message(Command("start"))
-async def cmd_start(msg: Message):
-    await ensure_user(msg.from_user.id, msg.from_user.username)
-    bal = await get_balance(msg.from_user.id)
-    await msg.answer(
-        f"👋 Добро пожаловать в <b>RubUP</b>!\n\n"
-        f"Ваш баланс: <b>{bal} ⭐</b>\n\n"
-        f"🎲 Кубик · 🪙 Монетка\n"
-        f"🎁 Создавайте и активируйте чеки!",
-        reply_markup=main_menu_kb(),
-    )
-
-@router.message(Command("admin"))
-async def cmd_admin(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
-    await msg.answer("🛠 <b>Админ-панель</b>\nВыберите действие:", reply_markup=admin_menu_kb())
-
-@router.callback_query(F.data == "menu")
-async def cb_menu(call: CallbackQuery):
-    bal = await get_balance(call.from_user.id)
-    await call.message.edit_text(
-        f"🏠 <b>Главное меню</b>\n\nБаланс: <b>{bal} ⭐</b>",
-        reply_markup=main_menu_kb(),
-    )
-    await call.answer()
-
-@router.callback_query(F.data == "profile")
-async def cb_profile(call: CallbackQuery):
-    bal = await get_balance(call.from_user.id)
-    await call.message.edit_text(
-        f"👤 <b>Профиль</b>\n\n"
-        f"ID: <code>{call.from_user.id}</code>\n"
-        f"Имя: {call.from_user.full_name}\n"
-        f"Баланс: <b>{bal} ⭐</b>",
-        reply_markup=kb(("⬅️ Назад", "menu")),
-    )
-    await call.answer()
-
-# ═══════════════ ПОПОЛНЕНИЕ ═══════════════
-@router.callback_query(F.data == "topup")
-async def cb_topup(call: CallbackQuery):
-    buttons = [(f"{s} ⭐", f"topup_{s}") for s in PRESET_TOPUP]
-    buttons.append(("⬅️ Назад", "menu"))
-    await call.message.edit_text(
-        "💳 <b>Пополнение баланса</b>\n\n"
-        f"Для пополнения переведите звёзды админу: @{ADMIN_USERNAME}\n"
-        "Нажмите на сумму ниже, чтобы получить уникальный код для оплаты.\n\n"
-        "Выберите сумму:",
-        reply_markup=kb(*buttons, adjust=(3, 2, 1)),
-    )
-    await call.answer()
-
-@router.callback_query(F.data.startswith("topup_"))
-async def cb_topup_amount(call: CallbackQuery):
-    amount = int(call.data.split("_")[1])
-    code = "TOP" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+def withdraw_amount(m):
+    try:
+        amount = int(m.text)
+    except:
+        return bot.send_message(m.chat.id, "❌ Неверная сумма.", reply_markup=main_kb())
+    uid = m.from_user.id
+    bal = get_bal(uid)
+    if amount <= 0 or amount > bal:
+        return bot.send_message(m.chat.id, "❌ Ошибка суммы.", reply_markup=main_kb())
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO topups (user_id, amount, code) VALUES (?, ?, ?)",
-            (call.from_user.id, amount, code)
-        )
-        await db.commit()
-
-    await call.message.edit_text(
-        f"🧾 <b>Заявка создана</b>\n\n"
-        f"Сумма: <b>{amount} ⭐</b>\n"
-        f"Ваш код: <code>{code}</code>\n\n"
-        f"1. Переведите {amount} звёзд админу: @{ADMIN_USERNAME}\n"
-        f"2. Отправьте админу ваш код: <code>{code}</code>\n"
-        f"3. После проверки админ начислит баланс.",
-        reply_markup=kb(("⬅️ Назад", "menu")),
-    )
-
-    admin_kb = kb(
-        ("✅ Подтвердить", f"adm_topup_ok_{code}"),
-        ("❌ Отклонить", f"adm_topup_no_{code}"),
-        adjust=(2,)
-    )
-    await call.bot.send_message(
-        ADMIN_ID,
-        f"📥 <b>Новая заявка на пополнение</b>\n\n"
-        f"Пользователь: <a href='tg://user?id={call.from_user.id}'>{call.from_user.full_name}</a>\n"
-        f"ID: <code>{call.from_user.id}</code>\n"
-        f"Сумма: <b>{amount} ⭐</b>\n"
-        f"Код: <code>{code}</code>",
-        reply_markup=admin_kb
-    )
-    await call.answer()
-
-# ═══════════════ ВЫВОД ═══════════════
-@router.callback_query(F.data == "withdraw")
-async def cb_withdraw(call: CallbackQuery):
-    bal = await get_balance(call.from_user.id)
-    if bal < MIN_WITHDRAW:
-        await call.answer(f"Минимум для вывода: {MIN_WITHDRAW} ⭐", show_alert=True)
-        return
-    opts = [a for a in (50, 100, 250, 500) if a <= bal]
-    buttons = [(f"{a} ⭐", f"wd_{a}") for a in opts]
-    buttons.append((f"Всё ({bal} ⭐)", f"wd_{bal}"))
-    buttons.append(("⬅️ Назад", "menu"))
-    await call.message.edit_text(
-        f"💸 <b>Вывод средств</b>\n\nБаланс: {bal} ⭐\nМинимум: {MIN_WITHDRAW} ⭐",
-        reply_markup=kb(*buttons, adjust=(3, 1, 1, 1)),
-    )
-    await call.answer()
-
-@router.callback_query(F.data.startswith("wd_"))
-async def cb_withdraw_confirm(call: CallbackQuery):
-    amount = int(call.data.split("_")[1])
-    bal = await get_balance(call.from_user.id)
-    if amount < MIN_WITHDRAW or amount > bal:
-        await call.answer("Некорректная сумма", show_alert=True)
-        return
-    new_bal = await add_balance(call.from_user.id, -amount)
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("INSERT INTO withdrawals (user_id, amount) VALUES (?, ?)", (call.from_user.id, amount))
+    # Списываем баланс и создаём заявку
+    add_bal(uid, -amount)
+    with sqlite3.connect(DB) as c:
+        cur = c.cursor()
+        cur.execute("INSERT INTO withdrawals (user_id, amount) VALUES (?, ?)", (uid, amount))
         req_id = cur.lastrowid
-        await db.commit()
-
-    admin_kb = kb(("✅ Одобрить", f"adm_wd_ok_{req_id}"), ("❌ Отклонить", f"adm_wd_no_{req_id}"), adjust=(2,))
-    await call.bot.send_message(
-        ADMIN_ID,
-        f"💸 <b>Заявка на вывод #{req_id}</b>\n\n"
-        f"Пользователь: <a href='tg://user?id={call.from_user.id}'>{call.from_user.full_name}</a>\n"
-        f"Username: @{call.from_user.username or '—'}\n"
-        f"Сумма: <b>{amount} ⭐</b>",
-        reply_markup=admin_kb,
-    )
-    await call.message.edit_text(
-        f"✅ Заявка <b>#{req_id}</b> на {amount} ⭐ создана.\n"
-        f"Баланс: {new_bal} ⭐\n\nОжидайте подтверждения.",
-        reply_markup=main_menu_kb(),
-    )
-    await call.answer()
-
-# ═══════════════ ЧЕКИ ═══════════════
-@router.callback_query(F.data == "checks_menu")
-async def cb_checks(call: CallbackQuery):
-    await call.message.edit_text(
-        "🎁 <b>Чеки на звёзды</b>\n\n"
-        "Вы можете создать чек на определённую сумму и отправить код другу.\n"
-        "Срок действия чека: 24 часа.",
-        reply_markup=kb(
-            ("➕ Создать чек", "check_create"),
-            ("✅ Активировать чек", "check_activate"),
-            ("⬅️ Назад", "menu"),
-            adjust=(1, 1, 1)
-        ),
-    )
-    await call.answer()
-
-@router.callback_query(F.data == "check_create")
-async def cb_check_create(call: CallbackQuery):
-    bal = await get_balance(call.from_user.id)
-    buttons = [(f"{a} ⭐", f"check_c_{a}") for a in PRESET_BETS if a <= bal]
-    buttons.append(("⬅️ Назад", "checks_menu"))
-    if len(buttons) == 1:
-        await call.answer("Недостаточно средств для создания чека (мин. 10 ⭐)", show_alert=True)
-        return
-    await call.message.edit_text(
-        f"Выберите сумму чека (ваш баланс: {bal} ⭐):",
-        reply_markup=kb(*buttons, adjust=(2, 2, 1))
-    )
-    await call.answer()
-
-@router.callback_query(F.data.startswith("check_c_"))
-async def cb_check_create_amount(call: CallbackQuery):
-    amount = int(call.data.split("_")[2])
-    bal = await get_balance(call.from_user.id)
-    if bal < amount:
-        await call.answer("Недостаточно средств", show_alert=True)
-        return
-
-    await add_balance(call.from_user.id, -amount)
-    code = "CHK" + "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+        c.commit()
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO checks (creator_id, amount, code) VALUES (?, ?, ?)", (call.from_user.id, amount, code))
-        await db.commit()
-
-    await call.message.edit_text(
-        f"✅ <b>Чек создан на {amount} ⭐</b>\n\n"
-        f"Код: <code>{code}</code>\n"
-        f"Перешлите этот код получателю. Он введёт его в разделе «Активировать чек».\n"
-        f"⏳ Действителен 24 часа.",
-        reply_markup=kb(("⬅️ Назад", "checks_menu")),
-    )
-    await call.answer()
-
-@router.callback_query(F.data == "check_activate")
-async def cb_check_activate(call: CallbackQuery, state: FSMContext):
-    await state.set_state(UserStates.activate_check)
-    await call.message.edit_text(
-        "Введите код чека (например, CHK12345678):",
-        reply_markup=kb(("⬅️ Отмена", "checks_menu"))
-    )
-    await call.answer()
-
-@router.message(UserStates.activate_check)
-async def process_check_activate(msg: Message, state: FSMContext):
-    code = msg.text.strip().upper()
-    await state.clear()
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, amount, is_activated, created_at FROM checks WHERE code=?", (code,)) as cur:
-            row = await cur.fetchone()
-    
-    if not row:
-        await msg.answer("❌ Чек не найден или неверный код.", reply_markup=main_menu_kb())
-        return
-    
-    chk_id, amount, is_act, created_at = row
-    if is_act:
-        await msg.answer("❌ Этот чек уже был активирован.", reply_markup=main_menu_kb())
-        return
-
-    created_dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
-    if datetime.now() - created_dt > timedelta(hours=24):
-        await msg.answer("❌ Срок действия чека истёк.", reply_markup=main_menu_kb())
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE checks SET is_activated=1, activated_by=? WHERE id=?", (msg.from_user.id, chk_id))
-        await db.commit()
-    
-    new_bal = await add_balance(msg.from_user.id, amount)
-    await msg.answer(
-        f"🎉 <b>Чек активирован!</b>\nВы получили <b>{amount} ⭐</b>\nБаланс: {new_bal} ⭐",
-        reply_markup=main_menu_kb()
-    )
-
-# ═══════════════ ИГРЫ ═══════════════
-@router.callback_query(F.data == "games")
-async def cb_games(call: CallbackQuery):
-    await call.message.edit_text(
-        "🎮 <b>Выберите игру</b>\n\n",
-        reply_markup=kb(
-            ("🎲 Кубик", "game_dice"),
-            ("🪙 Монетка", "game_coin"),
-            ("⬅️ Назад", "menu"),
-            adjust=(2, 1),
-        ),
-    )
-    await call.answer()
-
-async def rigged_coin(user_choice: str) -> str:
-    chance_str = await get_setting("win_rate", "45")
-    chance = int(chance_str)
-    win = random.randint(1, 100) <= chance
-    if win:
-        return user_choice
-    else:
-        return "t" if user_choice == "h" else "h"
-
-async def rigged_dice(mode: str, num: int | None) -> int:
-    chance_str = await get_setting("win_rate", "45")
-    chance = int(chance_str)
-    win = random.randint(1, 100) <= chance
-
-    if mode == "n":
-        if win: return num
-        else: return random.choice([n for n in range(1, 7) if n != num])
-    elif mode == "e":
-        if win: return random.choice([2, 4, 6])
-        else: return random.choice([1, 3, 5])
-    elif mode == "o":
-        if win: return random.choice([1, 3, 5])
-        else: return random.choice([2, 4, 6])
-    return random.randint(1, 6)
-
-@router.callback_query(F.data == "game_dice")
-async def dice_bet(call: CallbackQuery):
-    buttons = [(f"{a} ⭐", f"dice_b_{a}") for a in PRESET_BETS]
-    buttons.append(("⬅️ Назад", "games"))
-    await call.message.edit_text(
-        "🎲 <b>Кубик</b>\n\nНа число ×5, на чёт/нечет ×1.9\nВыберите ставку:",
-        reply_markup=kb(*buttons, adjust=(2, 2, 1)),
-    )
-    await call.answer()
-
-@router.callback_query(F.data.startswith("dice_b_"))
-async def dice_pick(call: CallbackQuery):
-    bet = int(call.data.split("_")[2])
-    bal = await get_balance(call.from_user.id)
-    if bet > bal:
-        await call.answer(f"Недостаточно. Баланс: {bal} ⭐", show_alert=True)
-        return
-    buttons = [(f"{DICE_FACE[n]} {n}", f"dice_p_n_{n}_{bet}") for n in range(1, 7)]
-    buttons += [
-        ("Чёт ×1.9", f"dice_p_e_{bet}"),
-        ("Нечет ×1.9", f"dice_p_o_{bet}"),
-        ("⬅️ Назад", "game_dice"),
-    ]
-    await call.message.edit_text(
-        f"🎲 <b>Кубик</b>\nСтавка: <b>{bet} ⭐</b>\n\nНа что ставите?",
-        reply_markup=kb(*buttons, adjust=(3, 3, 1, 1, 1)),
-    )
-    await call.answer()
-
-@router.callback_query(F.data.startswith("dice_p_"))
-async def dice_play(call: CallbackQuery):
-    p = call.data.split("_")
-    mode = p[2]
-    if mode == "n":
-        num, bet = int(p[3]), int(p[4])
-        choice = f"число {num}"
-    else:
-        num, bet = None, int(p[3])
-        choice = "чёт" if mode == "e" else "нечет"
-
-    bal = await get_balance(call.from_user.id)
-    if bet > bal:
-        await call.answer("Недостаточно средств", show_alert=True)
-        return
-
-    await add_balance(call.from_user.id, -bet)
-    await add_wagered(call.from_user.id, bet)
-    
-    roll = await rigged_dice(mode, num)
-
-    win = 0
-    if mode == "n" and roll == num: win = int(bet * 5)
-    elif mode == "e" and roll % 2 == 0: win = int(bet * 1.9)
-    elif mode == "o" and roll % 2 == 1: win = int(bet * 1.9)
-
-    if win:
-        new_bal = await add_balance(call.from_user.id, win)
-        result = f"🎉 <b>Выигрыш +{win} ⭐</b>"
-    else:
-        new_bal = await get_balance(call.from_user.id)
-        result = f"😢 <b>Проигрыш -{bet} ⭐</b>"
-
-    await call.message.edit_text(
-        f"🎲 Выпало: <b>{DICE_FACE[roll]} {roll}</b>\n"
-        f"Ваша ставка: {choice} ({bet} ⭐)\n\n"
-        f"{result}\nБаланс: <b>{new_bal} ⭐</b>",
-        reply_markup=kb(("🔄 Ещё", "game_dice"), ("🏠 Меню", "menu"), adjust=(2,)),
-    )
-    await call.answer()
-
-@router.callback_query(F.data == "game_coin")
-async def coin_bet(call: CallbackQuery):
-    buttons = [(f"{a} ⭐", f"coin_b_{a}") for a in PRESET_BETS]
-    buttons.append(("⬅️ Назад", "games"))
-    await call.message.edit_text(
-        "🪙 <b>Монетка</b> — выигрыш ×1.9\n\nВыберите ставку:",
-        reply_markup=kb(*buttons, adjust=(2, 2, 1)),
-    )
-    await call.answer()
-
-@router.callback_query(F.data.startswith("coin_b_"))
-async def coin_pick(call: CallbackQuery):
-    bet = int(call.data.split("_")[2])
-    bal = await get_balance(call.from_user.id)
-    if bet > bal:
-        await call.answer(f"Недостаточно. Баланс: {bal} ⭐", show_alert=True)
-        return
-    await call.message.edit_text(
-        f"🪙 <b>Монетка</b>\nСтавка: <b>{bet} ⭐</b>\n\nОрёл или решка?",
-        reply_markup=kb(("🦅 Орёл", f"coin_p_h_{bet}"), ("🌰 Решка", f"coin_p_t_{bet}"), ("⬅️ Назад", "game_coin"), adjust=(2, 1)),
-    )
-    await call.answer()
-
-@router.callback_query(F.data.startswith("coin_p_"))
-async def coin_play(call: CallbackQuery):
-    _, _, side, bet_s = call.data.split("_")
-    bet = int(bet_s)
-    bal = await get_balance(call.from_user.id)
-    if bet > bal:
-        await call.answer("Недостаточно средств", show_alert=True)
-        return
-
-    await add_balance(call.from_user.id, -bet)
-    await add_wagered(call.from_user.id, bet)
-    
-    result_side = await rigged_coin(side)
-    win = result_side == side
-    emoji = "🦅 Орёл" if result_side == "h" else "🌰 Решка"
-
-    if win:
-        payout = int(bet * 1.9)
-        new_bal = await add_balance(call.from_user.id, payout)
-        text_res = f"🎉 <b>Победа! +{payout} ⭐</b>"
-    else:
-        new_bal = await get_balance(call.from_user.id)
-        text_res = f"😢 <b>Проигрыш -{bet} ⭐</b>"
-
-    await call.message.edit_text(
-        f"🪙 Выпало: <b>{emoji}</b>\n\n{text_res}\nБаланс: <b>{new_bal} ⭐</b>",
-        reply_markup=kb(("🔄 Ещё", "game_coin"), ("🏠 Меню", "menu"), adjust=(2,)),
-    )
-    await call.answer()
-
-# ═══════════════ АДМИН ПАНЕЛЬ ═══════════════
-@router.callback_query(F.data == "adm_stats")
-async def adm_stats(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID: return
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*), SUM(balance), SUM(total_wagered) FROM users") as cur:
-            users, total_bal, total_wag = await cur.fetchone()
-    
-    total_bal = total_bal or 0
-    total_wag = total_wag or 0
-    await call.message.edit_text(
-        f"📊 <b>Статистика бота</b>\n\n"
-        f"👥 Юзеров: <b>{users}</b>\n"
-        f"💰 Общий баланс: <b>{total_bal} ⭐</b>\n"
-        f"🎲 Всего проиграно/поставлено: <b>{total_wag} ⭐</b>",
-        reply_markup=admin_menu_kb()
-    )
-    await call.answer()
-
-@router.callback_query(F.data == "adm_chance")
-async def adm_chance(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_ID: return
-    chance = await get_setting("win_rate", "45")
-    await state.set_state(AdminStates.set_chance)
-    await call.message.edit_text(
-        f"🎲 <b>Шанс выигрыша</b>\n\n"
-        f"Текущий шанс: <b>{chance}%</b>\n"
-        f"Введите новое значение от 0 до 100 (например, 40):",
-        reply_markup=kb(("⬅️ Отмена", "adm_cancel"))
-    )
-    await call.answer()
-
-@router.callback_query(F.data == "adm_cancel")
-async def adm_cancel(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_ID: return
-    await state.clear()
-    await call.message.edit_text("🛠 <b>Админ-панель</b>", reply_markup=admin_menu_kb())
-
-@router.message(AdminStates.set_chance)
-async def process_set_chance(msg: Message, state: FSMContext):
-    if msg.from_user.id != ADMIN_ID: return
+    bot.send_message(m.chat.id, f"✅ Заявка #{req_id} на {amount} ⭐ создана. Ожидайте NFT-подарок.", reply_markup=main_kb())
+    # Уведомление админу
     try:
-        val = int(msg.text)
-        if 0 <= val <= 100:
-            await set_setting("win_rate", str(val))
-            await msg.answer(f"✅ Шанс выигрыша изменён на {val}%", reply_markup=admin_menu_kb())
-            await state.clear()
-        else:
-            await msg.answer("Введите число от 0 до 100")
-    except ValueError:
-        await msg.answer("Ошибка. Введите число.")
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("✅ Отправить NFT", callback_data=f"send_nft_{req_id}"))
+        bot.send_message(ADMIN_ID, f"📥 Заявка на вывод #{req_id}\nПользователь: {uid}\nСумма: {amount} ⭐", reply_markup=mk)
+    except: pass
 
-@router.callback_query(F.data == "adm_broadcast")
-async def adm_broadcast(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_ID: return
-    await state.set_state(AdminStates.broadcast_msg)
-    await call.message.edit_text(
-        "📣 Введите текст для рассылки:\n(Поддерживается HTML)",
-        reply_markup=kb(("⬅️ Отмена", "adm_cancel"))
-    )
-    await call.answer()
-
-@router.message(AdminStates.broadcast_msg)
-async def process_broadcast(msg: Message, state: FSMContext, bot: Bot):
-    if msg.from_user.id != ADMIN_ID: return
-    await state.clear()
-    text = msg.html_text
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM users") as cur:
-            users = await cur.fetchall()
-    
-    await msg.answer(f"⏳ Начинаю рассылку на {len(users)} юзеров...")
-    success, fail = 0, 0
-    for u in users:
-        try:
-            await bot.send_message(u[0], text)
-            success += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            fail += 1
-            
-    await msg.answer(f"✅ Рассылка завершена.\nУспешно: {success}\nОшибок: {fail}", reply_markup=admin_menu_kb())
-
-@router.callback_query(F.data == "adm_topups")
-async def adm_topups(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID: return
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, user_id, amount, code, created_at FROM topups WHERE status='pending'") as cur:
-            rows = await cur.fetchall()
-    
-    if not rows:
-        await call.answer("Нет активных заявок на пополнение", show_alert=True)
-        return
-        
-    await call.message.edit_text("📥 <b>Ожидают пополнения:</b>", reply_markup=admin_menu_kb())
-    for r in rows:
-        await call.message.answer(
-            f"ID заявки: {r[0]}\nЮзер: {r[1]}\nСумма: {r[2]} ⭐\nКод: {r[3]}\nДата: {r[4]}",
-            reply_markup=kb(("✅ Подтвердить", f"adm_topup_ok_{r[3]}"), ("❌ Отклонить", f"adm_topup_no_{r[3]}"), adjust=(2,))
-        )
-    await call.answer()
-
-@router.callback_query(F.data.startswith("adm_topup_ok_"))
-async def adm_topup_approve(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID: return
-    code = call.data.split("_")[3]
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id, amount FROM topups WHERE code=? AND status='pending'", (code,)) as cur:
-            row = await cur.fetchone()
+# --- ОТПРАВКА NFT-ПОДАРКА (АДМИН) ---
+@bot.callback_query_handler(func=lambda c: c.data.startswith("send_nft_"))
+def send_nft(c):
+    if c.from_user.id != ADMIN_ID: return
+    req_id = int(c.data.split("_")[2])
+    with sqlite3.connect(DB) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, amount FROM withdrawals WHERE id=? AND status='pending'", (req_id,))
+        row = cur.fetchone()
         if not row:
-            await call.answer("Заявка не найдена или уже обработана", show_alert=True)
-            return
+            return bot.answer_callback_query(c.id, "Заявка не найдена", show_alert=True)
         uid, amount = row
-        await db.execute("UPDATE topups SET status='approved' WHERE code=?", (code,))
-        await db.commit()
-    
-    await add_balance(uid, amount)
-    try:
-        await call.bot.send_message(uid, f"✅ Ваша заявка на пополнение одобрена!\nНачислено: {amount} ⭐")
-    except: pass
-    await call.message.edit_text(f"✅ Заявка {code} одобрена. Начислено {amount} ⭐ юзеру {uid}.")
-
-@router.callback_query(F.data.startswith("adm_topup_no_"))
-async def adm_topup_reject(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID: return
-    code = call.data.split("_")[3]
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM topups WHERE code=? AND status='pending'", (code,)) as cur:
-            row = await cur.fetchone()
-        if not row:
-            await call.answer("Не найдено", show_alert=True)
-            return
-        await db.execute("UPDATE topups SET status='rejected' WHERE code=?", (code,))
-        await db.commit()
-    try:
-        await call.bot.send_message(row[0], f"❌ Ваша заявка на пополнение {code} отклонена.")
-    except: pass
-    await call.message.edit_text(f"❌ Заявка {code} отклонена.")
-
-@router.callback_query(F.data == "adm_withdrawals")
-async def adm_withdrawals(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID: return
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, user_id, amount, created_at FROM withdrawals WHERE status='pending'") as cur:
-            rows = await cur.fetchall()
-    
-    if not rows:
-        await call.answer("Нет активных заявок на вывод", show_alert=True)
-        return
         
-    await call.message.edit_text("📤 <b>Ожидают вывода:</b>", reply_markup=admin_menu_kb())
-    for r in rows:
-        await call.message.answer(
-            f"ID заявки: {r[0]}\nЮзер: {r[1]}\nСумма: {r[2]} ⭐\nДата: {r[3]}",
-            reply_markup=kb(("✅ Выплачено", f"adm_wd_ok_{r[0]}"), ("❌ Отклонить", f"adm_wd_no_{r[0]}"), adjust=(2,))
-        )
-    await call.answer()
+        # Получаем доступные подарки
+        try:
+            gifts = bot.get_available_gifts()
+        except Exception as e:
+            return bot.send_message(c.message.chat.id, f"⚠️ Ошибка получения подарков: {e}")
+        
+        # Выбираем первый доступный подарок (можно выбрать самый дешёвый)
+        gift_id = None
+        for g in gifts.gifts:
+            if g.star_count <= amount:  # Ищем подарок, который укладывается в сумму
+                gift_id = g.id
+                break
+        
+        if not gift_id:
+            # Если нет подходящего, берем первый
+            gift_id = gifts.gifts[0].id if gifts.gifts else None
+        
+        if not gift_id:
+            return bot.send_message(c.message.chat.id, "❌ Нет доступных подарков.")
+        
+        try:
+            # Отправляем NFT-подарок
+            bot.send_gift(
+                user_id=uid,
+                gift_id=gift_id,
+                text=f"Вывод {amount} ⭐ из казино",
+                pay_for_upgrade=True  # Оплачиваем апгрейд, чтобы получатель не платил
+            )
+            cur.execute("UPDATE withdrawals SET status='approved' WHERE id=?", (req_id,))
+            conn.commit()
+            bot.send_message(c.message.chat.id, f"✅ NFT-подарок отправлен пользователю {uid}.")
+            try:
+                bot.send_message(uid, f"🎁 Вам отправлен NFT-подарок на сумму {amount} ⭐!")
+            except: pass
+        except Exception as e:
+            bot.send_message(c.message.chat.id, f"⚠️ Ошибка sendGift: {e}")
+    bot.answer_callback_query(c.id)
 
-@router.callback_query(F.data.startswith("adm_wd_ok_"))
-async def adm_wd_approve(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID: return
-    req_id = int(call.data.split("_")[3])
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id, amount FROM withdrawals WHERE id=? AND status='pending'", (req_id,)) as cur:
-            row = await cur.fetchone()
-        if not row:
-            await call.answer("Не найдено", show_alert=True)
-            return
-        await db.execute("UPDATE withdrawals SET status='approved' WHERE id=?", (req_id,))
-        await db.commit()
-    try:
-        await call.bot.send_message(row[0], f"✅ Ваша заявка на вывод #{req_id} одобрена.\nВыплачено: {row[1]} ⭐")
-    except: pass
-    await call.message.edit_text(f"✅ Вывод #{req_id} подтверждён.")
+# --- ИГРЫ ---
+@bot.message_handler(func=lambda m: m.text == "🎮 Играть")
+def play(m):
+    bot.send_message(m.chat.id, "Выберите игру:", reply_markup=games_kb())
 
-@router.callback_query(F.data.startswith("adm_wd_no_"))
-async def adm_wd_reject(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID: return
-    req_id = int(call.data.split("_")[3])
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id, amount FROM withdrawals WHERE id=? AND status='pending'", (req_id,)) as cur:
-            row = await cur.fetchone()
-        if not row:
-            await call.answer("Не найдено", show_alert=True)
-            return
-        await db.execute("UPDATE withdrawals SET status='rejected' WHERE id=?", (req_id,))
-        await db.commit()
+# Кубик
+@bot.callback_query_handler(func=lambda c: c.data == "g_dice")
+def dice_bet(c):
+    msg = bot.send_message(c.message.chat.id, "Введите ставку:", reply_markup=types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(msg, dice_roll)
+
+def dice_roll(m):
+    try: bet = int(m.text)
+    except: return bot.send_message(m.chat.id, "❌ Неверная ставка.", reply_markup=main_kb())
+    uid = m.from_user.id
+    if bet < int(get_set("min_bet")) or bet > get_bal(uid):
+        return bot.send_message(m.chat.id, "❌ Ошибка ставки.", reply_markup=main_kb())
     
-    await add_balance(row[0], row[1])
-    try:
-        await call.bot.send_message(row[0], f"❌ Ваша заявка на вывод #{req_id} отклонена.\nБаланс возвращён.")
-    except: pass
-    await call.message.edit_text(f"❌ Вывод #{req_id} отклонён, средства возвращены.")
-
-# ─── ЗАПУСК ────────────────────────────────────────────────
-async def main():
-    await db_init()
-
-    session = AiohttpSession(api=TelegramAPIServer.from_base(API_BASE))
-    bot = Bot(
-        token=BOT_TOKEN, 
-        session=session, 
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
+    add_bal(uid, -bet)
+    win = random.randint(1, 6) % 2 == 0  # Чет/нечет
+    rate = int(get_set("win_rate"))
+    win = random.randint(1, 100) <= rate
     
-    dp = Dispatcher()
-    dp.include_router(router)
+    if win:
+        payout = bet * 2
+        add_bal(uid, payout)
+        add_stat(uid, bet, payout)
+        log_game(uid, "dice", bet, payout)
+        bot.send_message(m.chat.id, f"🎲 Победа! +{payout} ⭐", reply_markup=main_kb())
+    else:
+        add_stat(uid, bet, 0)
+        log_game(uid, "dice", bet, 0)
+        bot.send_message(m.chat.id, f"🎲 Проигрыш. -{bet} ⭐", reply_markup=main_kb())
 
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Главное меню"),
-        BotCommand(command="admin", description="Админ панель"),
-    ])
+# Монетка
+@bot.callback_query_handler(func=lambda c: c.data == "g_coin")
+def coin_bet(c):
+    msg = bot.send_message(c.message.chat.id, "Введите ставку:", reply_markup=types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(msg, coin_flip)
 
-    log.info("Бот RubUP запущен!")
-    await dp.start_polling(bot)
+def coin_flip(m):
+    try: bet = int(m.text)
+    except: return bot.send_message(m.chat.id, "❌ Неверная ставка.", reply_markup=main_kb())
+    uid = m.from_user.id
+    if bet < int(get_set("min_bet")) or bet > get_bal(uid):
+        return bot.send_message(m.chat.id, "❌ Ошибка ставки.", reply_markup=main_kb())
+    
+    add_bal(uid, -bet)
+    rate = int(get_set("win_rate"))
+    win = random.randint(1, 100) <= rate
+    
+    if win:
+        payout = bet * 2
+        add_bal(uid, payout)
+        add_stat(uid, bet, payout)
+        log_game(uid, "coin", bet, payout)
+        bot.send_message(m.chat.id, f"🪙 Орёл! Победа! +{payout} ⭐", reply_markup=main_kb())
+    else:
+        add_stat(uid, bet, 0)
+        log_game(uid, "coin", bet, 0)
+        bot.send_message(m.chat.id, f"🪙 Решка. Проигрыш. -{bet} ⭐", reply_markup=main_kb())
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# Мины (упрощённо)
+@bot.callback_query_handler(func=lambda c: c.data == "g_mines")
+def mines_bet(c):
+    msg = bot.send_message(c.message.chat.id, "Введите ставку:", reply_markup=types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(msg, mines_start)
+
+def mines_start(m):
+    try: bet = int(m.text)
+    except: return bot.send_message(m.chat.id, "❌ Неверная ставка.", reply_markup=main_kb())
+    uid = m.from_user.id
+    if bet < int(get_set("min_bet")) or bet > get_bal(uid):
+        return bot.send_message(m.chat.id, "❌ Ошибка ставки.", reply_markup=main_kb())
+    
+    add_bal(uid, -bet)
+    # Простая логика: 3 мины на 9 клеток
+    mines = set(random.sample(range(9), 3))
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    for i in range(9):
+        kb.add(types.InlineKeyboardButton("⬜", callback_data=f"mine_{i}_{bet}"))
+    bot.send_message(m.chat.id, "💣 Выберите клетку (3 мины из 9):", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("mine_"))
+def mine_click(c):
+    _, idx, bet = c.data.split("_")
+    idx, bet = int(idx), int(bet)
+    uid = c.from_user.id
+    # Упрощённо: 30% шанс победы
+    rate = int(get_set("win_rate"))
+    win = random.randint(1, 100) <= rate
+    if win:
+        payout = bet * 2
+        add_bal(uid, payout)
+        add_stat(uid, bet, payout)
+        log_game(uid, "mines", bet, payout)
+        bot.edit_message_text(f"💣 Победа! +{payout} ⭐", c.message.chat.id, c.message.message_id)
+    else:
+        add_stat(uid, bet, 0)
+        log_game(uid, "mines", bet, 0)
+        bot.edit_message_text(f"💣 Мина! Проигрыш. -{bet} ⭐", c.message.chat.id, c.message.message_id)
+    bot.answer_callback_query(c.id)
+
+# Слоты
+@bot.callback_query_handler(func=lambda c: c.data == "g_slots")
+def slots_bet(c):
+    msg = bot.send_message(c.message.chat.id, "Введите ставку:", reply_markup=types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(msg, slots_play)
+
+def slots_play(m):
+    try: bet = int(m.text)
+    except: return bot.send_message(m.chat.id, "❌ Неверная ставка.", reply_markup=main_kb())
+    uid = m.from_user.id
+    if bet < int(get_set("min_bet")) or bet > get_bal(uid):
+        return bot.send_message(m.chat.id, "❌ Ошибка ставки.", reply_markup=main_kb())
+    
+    add_bal(uid, -bet)
+    rate = int(get_set("win_rate"))
+    win = random.randint(1, 100) <= rate
+    if win:
+        payout = bet * 5
+        add_bal(uid, payout)
+        add_stat(uid, bet, payout)
+        log_game(uid, "slots", bet, payout)
+        bot.send_message(m.chat.id, f"🎰 Джекпот! +{payout} ⭐", reply_markup=main_kb())
+    else:
+        add_stat(uid, bet, 0)
+        log_game(uid, "slots", bet, 0)
+        bot.send_message(m.chat.id, f"🎰 Проигрыш. -{bet} ⭐", reply_markup=main_kb())
+
+# Рулетка
+@bot.callback_query_handler(func=lambda c: c.data == "g_roul")
+def roul_bet(c):
+    msg = bot.send_message(c.message.chat.id, "Введите ставку:", reply_markup=types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(msg, roul_play)
+
+def roul_play(m):
+    try: bet = int(m.text)
+    except: return bot.send_message(m.chat.id, "❌ Неверная ставка.", reply_markup=main_kb())
+    uid = m.from_user.id
+    if bet < int(get_set("min_bet")) or bet > get_bal(uid):
+        return bot.send_message(m.chat.id, "❌ Ошибка ставки.", reply_markup=main_kb())
+    
+    add_bal(uid, -bet)
+    rate = int(get_set("win_rate"))
+    win = random.randint(1, 100) <= rate
+    if win:
+        payout = bet * 3
+        add_bal(uid, payout)
+        add_stat(uid, bet, payout)
+        log_game(uid, "roulette", bet, payout)
+        bot.send_message(m.chat.id, f"🎯 Победа! +{payout} ⭐", reply_markup=main_kb())
+    else:
+        add_stat(uid, bet, 0)
+        log_game(uid, "roulette", bet, 0)
+        bot.send_message(m.chat.id, f"🎯 Проигрыш. -{bet} ⭐", reply_markup=main_kb())
+
+# --- ИСТОРИЯ ---
+@bot.message_handler(func=lambda m: m.text == "📜 История")
+def hist(m):
+    with sqlite3.connect(DB) as c:
+        rows = c.execute("SELECT game, bet, win, ts FROM history WHERE user_id=? ORDER BY id DESC LIMIT 10", (m.from_user.id,)).fetchall()
+    if not rows:
+        return bot.send_message(m.chat.id, "История пуста.", reply_markup=main_kb())
+    text = "📜 <b>Последние игры:</b>\n\n"
+    for g, b, w, ts in rows:
+        text += f"{g}: ставка {b}, выигрыш {w} ({ts})\n"
+    bot.send_message(m.chat.id, text, reply_markup=main_kb(), parse_mode="HTML")
+
+# --- ПОМОЩЬ ---
+@bot.message_handler(func=lambda m: m.text == "ℹ️ Помощь")
+def help_cmd(m):
+    bot.send_message(m.chat.id, f"ℹ️ <b>Помощь</b>\n\n🎮 Игры: Кубик, Монетка, Мины, Слоты, Рулетка\n💳 Пополнение через звёзды\n💸 Вывод через NFT-подарки\n\nПоддержка: {SUPPORT}\nАдмин: {ADMIN_U}\nБот: {BOT_U}", reply_markup=main_kb(), parse_mode="HTML")
+
+# --- АДМИН ---
+@bot.message_handler(commands=["admin"])
+def admin_panel(m):
+    if m.from_user.id != ADMIN_ID: return
+    bot.send_message(m.chat.id, "🛠 <b>Админ-панель</b>", reply_markup=admin_kb(), parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("a_"))
+def admin_cb(c):
+    if c.from_user.id != ADMIN_ID: return
+    if c.data == "a_stats":
+        with sqlite3.connect(DB) as conn:
+            u = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            t = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+        bot.send_message(c.message.chat.id, f"📊 Юзеров: {u}\nИгр: {t}")
+    elif c.data == "a_rate":
+        msg = bot.send_message(c.message.chat.id, f"Текущий шанс: {get_set('win_rate')}%\nВведите новый (0-100):")
+        bot.register_next_step_handler(msg, set_rate)
+    elif c.data == "a_wds":
+        with sqlite3.connect(DB) as conn:
+            rows = conn.execute("SELECT id, user_id, amount FROM withdrawals WHERE status='pending'").fetchall()
+        if not rows: return bot.answer_callback_query(c.id, "Нет заявок", show_alert=True)
+        text = "📥 <b>Заявки:</b>\n\n"
+        mk = types.InlineKeyboardMarkup(row_width=1)
+        for rid, uid, amt in rows:
+            text += f"#{rid}: {uid} — {amt} ⭐\n"
+            mk.add(types.InlineKeyboardButton(f"Отправить NFT #{rid}", callback_data=f"send_nft_{rid}"))
+        bot.send_message(c.message.chat.id, text, reply_markup=mk, parse_mode="HTML")
+    bot.answer_callback_query(c.id)
+
+def set_rate(m):
+    try:
+        rate = int(m.text)
+        if 0 <= rate <= 100:
+            set_set("win_rate", rate)
+            bot.send_message(m.chat.id, f"✅ Шанс установлен: {rate}%", reply_markup=main_kb())
+    except: bot.send_message(m.chat.id, "❌ Ошибка.")
+
+# --- ЗАПУСК ---
+db_init()
+print("Казино-бот запущен!")
+bot.infinity_polling()
